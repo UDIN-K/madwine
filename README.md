@@ -11,6 +11,8 @@ Run [Madium](https://madium.net) on Linux via Wine. Unofficial, community-mainta
 - Installs **WebView2 Runtime** (offline installer — no bootstrapper issues)
 - Fixes WebView2 registry keys (Wine's installer often skips this step)
 - Handles the half-install problem where WebView2 unpacks to `EdgeCore` but never copies to `EdgeWebView/Application`
+- **Downloads Madium CDN files from host Linux** (bypasses Wine SSL-to-IP failure that causes the CDN Error)
+- Auto-verifies downloads with SHA256 checksums
 
 ## Requirements
 
@@ -44,7 +46,7 @@ chmod +x install.sh
 ./install.sh install
 ```
 
-That's it. All dependencies are downloaded and installed automatically.
+That's it. All dependencies and executor files are downloaded and installed automatically.
 
 ## Usage
 
@@ -52,7 +54,8 @@ That's it. All dependencies are downloaded and installed automatically.
 ./install.sh <command>
 
 Commands:
-  install     Full install: prefix + .NET 8 + WebView2 + Madium
+  install     Full install: prefix + .NET 8 + WebView2 + Madium + CDN files
+  update      Update Madium CDN files (DLLs + cache) to latest version
   deps        Install dependencies only (.NET 8 + WebView2)
   launch      Launch Madium
   desktop     Create desktop shortcut
@@ -65,6 +68,11 @@ Commands:
 ### Launch Madium
 ```bash
 ./install.sh launch
+```
+
+### Update after Madium releases a new version
+```bash
+./install.sh update
 ```
 
 ### Create a desktop shortcut
@@ -84,6 +92,7 @@ If you already have a Wine prefix (e.g. from Faugus Launcher), point madwine at 
 ```bash
 export WINEPREFIX="/path/to/your/prefix"
 ./install.sh deps      # install .NET 8 + WebView2 into existing prefix
+./install.sh update    # download CDN files into existing prefix
 ```
 
 For Proton-based setups:
@@ -91,6 +100,7 @@ For Proton-based setups:
 export WINE="/path/to/Proton/files/bin/wine"
 export WINEPREFIX="/path/to/prefix"
 ./install.sh deps
+./install.sh update
 ```
 
 ## Environment variables
@@ -106,15 +116,18 @@ export WINEPREFIX="/path/to/prefix"
 ### "The dependency installer stopped before finishing"
 This is what madwine fixes. The Madium installer tries to run .NET 8 and WebView2 bootstrappers, which fail under Wine. madwine pre-installs both using methods that work in Wine.
 
+### "Couldn't reach the Madium server" / CDN Error
+Wine can't make SSL connections to bare IP addresses (like `165.245.199.89`). madwine downloads the files from the host Linux system instead — no Wine networking needed. Run:
+```bash
+./install.sh update
+```
+
 ### Black/blank Madium window
 WebView2 registry keys are missing. Run:
 ```bash
 ./install.sh deps
 ```
 This re-registers WebView2 in all required registry locations.
-
-### CDN Error after install
-Known Madium issue on Linux ([#2](https://github.com/Ring0lw/madwine/issues/2)). Workaround: download Madium files manually from the CDN link and place them in the Wine prefix. See the wiki for exact paths.
 
 ### WebView2 installer hangs
 The WebView2 bootstrapper (online installer) hangs under Wine. madwine uses the **offline standalone installer** instead, which completes without issues.
@@ -134,16 +147,19 @@ wine ~/.local/share/madwine/cache/dotnet-8-desktop-runtime.exe
 4. Runs the WebView2 installer; if it half-completes (common Wine behavior), manually copies the runtime from `EdgeCore/` to `EdgeWebView/Application/`
 5. Registers WebView2 in the Windows registry (3 key locations: HKLM 32-bit, HKLM 64-bit, HKCU)
 6. Downloads and runs MadiumInstaller.exe
+7. **Fetches Madium CDN files** (Madium.dll, RobloxPlayerBeta.dll, cache.bin) from the host — bypassing Wine's broken SSL-to-IP networking
+8. Verifies all downloads with SHA256 checksums from the manifest
 
 ## Contributing
 
 PRs welcome. The main areas that need work:
 
-- [ ] Auto-update Madium when new versions release
-- [ ] CDN download fallback / mirror
+- [x] ~~CDN download fallback~~ — solved: host-side download bypasses Wine
+- [ ] Auto-update on Madium version change
 - [ ] Flatpak packaging
 - [ ] ARM64 support
 - [ ] Better Proton/Steam integration
+- [ ] Roblox version pinning
 
 ## License
 

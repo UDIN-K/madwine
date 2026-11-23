@@ -11,6 +11,8 @@ WINE="${WINE:-wine}"
 DOTNET_URL="https://builds.dotnet.microsoft.com/dotnet/WindowsDesktop/8.0.34/windowsdesktop-runtime-8.0.34-win-x64.exe"
 WEBVIEW2_URL="https://go.microsoft.com/fwlink/p/?LinkId=2124701"  # offline standalone x64
 WEBVIEW2_GUID="{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+MADIUM_CDN="https://165.245.199.89"
+MADIUM_MANIFEST="$MADIUM_CDN/manifest.json"
 
 # ── Helpers ─────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
@@ -158,40 +160,150 @@ register_webview2() {
     ok "WebView2 registry keys set (v$ver)"
 }
 
+# ── Madium CDN files ────────────────────────────────────────────────
+fetch_madium_files() {
+    # Wine can't reach the Madium CDN (SSL to bare IP fails).
+    # Download manifest + files from the host and place them in the prefix.
+    local madium_dir=""
+    for user_dir in "$WINEPREFIX/drive_c/users/"*/; do
+        if [ -d "$user_dir/AppData/Local/Madium" ]; then
+            madium_dir="$user_dir/AppData/Local/Madium"
+            break
+        fi
+    done
+
+    if [ -z "$madium_dir" ]; then
+        # Create default location
+        local wine_user
+        wine_user=$(WINEPREFIX="$WINEPREFIX" "$WINE" cmd /c "echo %USERNAME%" 2>/dev/null | tr -d '\r\n') || wine_user="$(whoami)"
+        madium_dir="$WINEPREFIX/drive_c/users/$wine_user/AppData/Local/Madium"
+        mkdir -p "$madium_dir/Bin"
+    fi
+
+    local bin_dir="$madium_dir/Bin"
+    mkdir -p "$bin_dir" "$MADWINE_DIR/cache"
+
+    # Fetch manifest
+    info "Fetching Madium CDN manifest..."
+    local manifest
+    manifest=$(get "$MADIUM_MANIFEST" 2>/dev/null) || {
+        warn "Could not reach Madium CDN ($MADIUM_CDN)"
+        warn "Check your internet connection or try again later."
+        return 1
+    }
+
+    local version
+    version=$(echo "$manifest" | grep -o '"version"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 | grep -o '"[^"]*"$' | tr -d '"')
+    info "Madium CDN version: $version"
+
+    # Parse files from manifest and download each
+    local names urls sizes sha256s
+    names=$(echo "$manifest" | grep -o '"name"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
+    urls=$(echo "$manifest" | grep -o '"url"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
+    sha256s=$(echo "$manifest" | grep -o '"sha256"[[:space:]]*:[[:space:]]*"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
+
+    local name_arr=() url_arr=() sha_arr=()
+    while IFS= read -r line; do name_arr+=("$line"); done <<< "$names"
+    while IFS= read -r line; do url_arr+=("$line"); done <<< "$urls"
+    while IFS= read -r line; do sha_arr+=("$line"); done <<< "$sha256s"
+
+    local i total=${#name_arr[@]} failed=0
+    for ((i=0; i<total; i++)); do
+        local fname="${name_arr[$i]}"
+        local furl="${url_arr[$i]}"
+        local fsha="${sha_arr[$i]}"
+        local dest="$bin_dir/$fname"
+        local cache="$MADWINE_DIR/cache/$fname"
+
+        # Check if file exists and matches SHA256
+        if [ -f "$dest" ] && command -v sha256sum &>/dev/null; then
+            local existing_sha
+            existing_sha=$(sha256sum "$dest" | awk '{print $1}')
+            if [ "$existing_sha" = "$fsha" ]; then
+                ok "$fname already up to date"
+                continue
+            fi
+        fi
+
+        info "Downloading $fname ($((i+1))/$total)..."
+
+        # Download to cache first (resume-friendly), then copy to prefix
+        if ! fetch "$furl" "$cache"; then
+            warn "Failed to download $fname"
+            ((failed++))
+            continue
+        fi
+
+        # Verify SHA256
+        if command -v sha256sum &>/dev/null; then
+            local dl_sha
+            dl_sha=$(sha256sum "$cache" | awk '{print $1}')
+            if [ "$dl_sha" != "$fsha" ]; then
+                warn "$fname SHA256 mismatch (expected $fsha, got $dl_sha)"
+                rm -f "$cache"
+                ((failed++))
+                continue
+            fi
+        fi
+
+        cp -f "$cache" "$dest"
+        ok "$fname downloaded and verified"
+    done
+
+    if [ $failed -gt 0 ]; then
+        warn "$failed file(s) failed to download"
+        return 1
+    fi
+
+    ok "All Madium CDN files installed (v$version)"
+}
+
 # ── Madium installer ───────────────────────────────────────────────
 install_madium() {
-    local madium_exe="$WINEPREFIX/drive_c/users/$(whoami)/AppData/Local/Madium/Bin/Madium.exe"
+    # Find or create Madium directory
+    local madium_exe=""
+    for user_dir in "$WINEPREFIX/drive_c/users/"*/; do
+        local candidate="$user_dir/AppData/Local/Madium/Bin/Madium.exe"
+        if [ -f "$candidate" ]; then
+            madium_exe="$candidate"
+            break
+        fi
+    done
+
     local installer_url repo="UDIN-K/madwine"
 
-    # Check if Madium binary exists
-    if [ -f "$madium_exe" ]; then
-        ok "Madium already installed"
-        return 0
-    fi
+    if [ -z "$madium_exe" ]; then
+        # Try to get the installer from releases or madium.net
+        info "Fetching Madium installer..."
+        local madium_installer="$MADWINE_DIR/cache/MadiumInstaller.exe"
 
-    # Try to get the installer from releases
-    info "Fetching latest Madium installer..."
-    local madium_installer="$MADWINE_DIR/cache/MadiumInstaller.exe"
+        if [ ! -f "$madium_installer" ]; then
+            installer_url=$(get "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
+                | grep -o 'https://[^"]*MadiumInstaller[^"]*\.exe' | head -1) || true
 
-    if [ ! -f "$madium_installer" ]; then
-        # Try GitHub releases first
-        installer_url=$(get "https://api.github.com/repos/$repo/releases/latest" 2>/dev/null \
-            | grep -o 'https://[^"]*MadiumInstaller[^"]*\.exe' | head -1) || true
-
-        if [ -n "$installer_url" ]; then
-            fetch "$installer_url" "$madium_installer"
-        else
-            warn "No installer found in releases."
-            warn "Download MadiumInstaller.exe manually from https://madium.net"
-            warn "Then place it at: $madium_installer"
-            warn "And re-run this script."
-            return 1
+            if [ -n "$installer_url" ]; then
+                fetch "$installer_url" "$madium_installer"
+            else
+                warn "No installer found in releases."
+                warn "Download MadiumInstaller.exe manually from https://madium.net"
+                warn "Then place it at: $madium_installer"
+                warn "And re-run this script."
+                return 1
+            fi
         fi
+
+        info "Running Madium installer..."
+        info "  → Select 'Custom Installation'"
+        info "  → Untick 'Auto exclude from Windows Defender'"
+        info "  → Continue with install"
+        WINEPREFIX="$WINEPREFIX" "$WINE" "$madium_installer" 2>/dev/null || true
+    else
+        ok "Madium.exe found"
     fi
 
-    info "Running Madium installer..."
-    WINEPREFIX="$WINEPREFIX" "$WINE" "$madium_installer" 2>/dev/null || true
-    ok "Madium installer finished"
+    # Fetch CDN files (DLLs + cache) — Wine can't do this itself
+    info "Fetching Madium executor files from CDN..."
+    fetch_madium_files
 }
 
 # ── Launch ──────────────────────────────────────────────────────────
@@ -247,7 +359,8 @@ madwine - Run Madium on Linux
 Usage: $0 <command>
 
 Commands:
-  install     Full install: prefix + .NET 8 + WebView2 + Madium
+  install     Full install: prefix + .NET 8 + WebView2 + Madium + CDN files
+  update      Update Madium CDN files (DLLs + cache)
   deps        Install dependencies only (.NET 8 + WebView2)
   launch      Launch Madium
   desktop     Create desktop shortcut
@@ -262,6 +375,11 @@ Environment:
   MADWINE_DIR Data directory (default: ~/.local/share/madwine)
 
 EOF
+}
+
+cmd_update() {
+    info "Updating Madium CDN files..."
+    fetch_madium_files
 }
 
 cmd_install() {
@@ -314,7 +432,16 @@ cmd_status() {
     local found=0
     for user_dir in "$WINEPREFIX/drive_c/users/"*/; do
         if [ -f "$user_dir/AppData/Local/Madium/Bin/Madium.exe" ]; then
-            ok "Madium"
+            ok "Madium.exe"
+            # Check CDN files
+            local bin_dir="$user_dir/AppData/Local/Madium/Bin"
+            for f in Madium.dll RobloxPlayerBeta.dll cache.bin; do
+                if [ -f "$bin_dir/$f" ]; then
+                    ok "  $f"
+                else
+                    warn "  $f: MISSING"
+                fi
+            done
             found=1
             break
         fi
@@ -338,6 +465,7 @@ cmd_clean() {
 
 case "${1:-help}" in
     install)  cmd_install ;;
+    update)   cmd_update ;;
     deps)     cmd_deps ;;
     launch)   shift; launch_madium "$@" ;;
     desktop)  create_desktop_entry ;;

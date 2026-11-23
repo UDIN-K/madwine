@@ -258,6 +258,69 @@ fetch_madium_files() {
     ok "All Madium CDN files installed (v$version)"
 }
 
+# ── Patch Roblox with Madium files ─────────────────────────────────
+patch_roblox() {
+    # Madium needs its DLLs placed in the Roblox version folder.
+    # Wine can't download them (CDN uses SSL to bare IP), so we do it here.
+    local madium_dir="" roblox_ver_dir=""
+
+    # Find Madium directory
+    for user_dir in "$WINEPREFIX/drive_c/users/"*/; do
+        if [ -d "$user_dir/AppData/Local/Madium" ]; then
+            madium_dir="$user_dir/AppData/Local/Madium"
+            break
+        fi
+    done
+    [ -n "$madium_dir" ] || { warn "Madium not found in prefix"; return 1; }
+
+    local bin_dir="$madium_dir/Bin"
+
+    # Find Roblox version directory from Madium config
+    local roblox_path=""
+    if [ -f "$madium_dir/Config/settings.json" ]; then
+        roblox_path=$(grep -o '"roblox\.install_path"[[:space:]]*:[[:space:]]*"[^"]*"' "$madium_dir/Config/settings.json" \
+            | grep -o '"[^"]*"$' | tr -d '"' | sed 's|\\\\|/|g; s|^C:|'"$WINEPREFIX/drive_c"'|')
+    fi
+
+    # Fallback: find latest Roblox version
+    if [ -z "$roblox_path" ] || [ ! -d "$roblox_path" ]; then
+        for user_dir in "$WINEPREFIX/drive_c/users/"*/; do
+            local versions_dir="$user_dir/AppData/Local/Roblox/Versions"
+            if [ -d "$versions_dir" ]; then
+                roblox_path=$(find "$versions_dir" -mindepth 1 -maxdepth 1 -type d -name "version-*" | sort | tail -1)
+                break
+            fi
+        done
+    fi
+
+    if [ -z "$roblox_path" ] || [ ! -d "$roblox_path" ]; then
+        warn "Roblox version folder not found — launch Roblox first, then run update"
+        return 1
+    fi
+
+    info "Patching Roblox at: $(basename "$roblox_path")"
+
+    # Check required files exist in Bin/
+    for f in Madium.dll RobloxPlayerBeta.dll cache.bin; do
+        if [ ! -f "$bin_dir/$f" ]; then
+            warn "$f not found in Bin/ — run '$0 update' first"
+            return 1
+        fi
+    done
+
+    # Backup original RobloxPlayerBeta.dll (only first time)
+    if [ -f "$roblox_path/RobloxPlayerBeta.dll" ] && [ ! -f "$roblox_path/RobloxPlayerBeta.dll.orig" ]; then
+        cp "$roblox_path/RobloxPlayerBeta.dll" "$roblox_path/RobloxPlayerBeta.dll.orig"
+        ok "Backed up original RobloxPlayerBeta.dll"
+    fi
+
+    # Copy patched files
+    cp -f "$bin_dir/Madium.dll" "$roblox_path/Madium.dll"
+    cp -f "$bin_dir/RobloxPlayerBeta.dll" "$roblox_path/RobloxPlayerBeta.dll"
+    cp -f "$bin_dir/cache.bin" "$roblox_path/cache.bin"
+    ok "Roblox patched with Madium files"
+}
+
 # ── Madium installer ───────────────────────────────────────────────
 install_madium() {
     # Find or create Madium directory
@@ -304,6 +367,9 @@ install_madium() {
     # Fetch CDN files (DLLs + cache) — Wine can't do this itself
     info "Fetching Madium executor files from CDN..."
     fetch_madium_files
+
+    # Patch Roblox with downloaded files
+    patch_roblox
 }
 
 # ── Launch ──────────────────────────────────────────────────────────
@@ -380,6 +446,7 @@ EOF
 cmd_update() {
     info "Updating Madium CDN files..."
     fetch_madium_files
+    patch_roblox
 }
 
 cmd_install() {
